@@ -260,9 +260,10 @@ static int find_include_path(
 }
 
 void print_help(FILE* of) {
-	fprintf(of, "usage: depi [-h] <-I=path|-S=path>* <file>+\n");
+	fprintf(of, "usage: depi [-h] <-I=path|-S=path>* <file|->+\n");
 	fprintf(of, "  -I=path  add an include search directory (options must precede files)\n");
 	fprintf(of, "  -S=path  add a system include directory (resolved dependencies are leaves)\n");
+	fprintf(of, "  -        read file paths from stdin, one per line\n");
 	fprintf(of, "  -h       show this help\n");
 }
 
@@ -349,6 +350,49 @@ static void settings_free(struct settings* settings) {
 	free(settings->target_files.items);
 }
 
+static int target_add(struct settings* settings, char const* path, int dedup) {
+	if (dedup && contains(
+		settings->target_files.items, settings->target_files.count, path
+	))
+		return 0;
+
+	char* copy = strdup(path);
+	if (copy == NULL) {
+		perror("depi: strdup");
+		return -1;
+	}
+	pushback(settings->target_files, copy);
+	return 0;
+}
+
+static int read_targets_stdin(struct settings* settings) {
+	char* line = NULL;
+	size_t cap = 0;
+	ssize_t nread;
+	int status = 0;
+
+	while ((nread = getline(&line, &cap, stdin)) != -1) {
+		if (nread > 0 && line[nread - 1] == '\n') {
+			line[nread - 1] = '\0';
+			nread--;
+		}
+		if (nread == 0)
+			continue;
+
+		if (target_add(settings, line, 0) < 0) {
+			status = -1;
+			break;
+		}
+	}
+
+	if (ferror(stdin)) {
+		fprintf(stderr, "depi: stdin: %s\n", strerror(errno));
+		status = -1;
+	}
+	free(line);
+	return status;
+}
+
 int parse_settings(int argc, char** argv, struct settings* settings) {
 	if (argc <= 1) {
 		print_help(stderr);
@@ -398,16 +442,19 @@ int parse_settings(int argc, char** argv, struct settings* settings) {
 		pushback(settings->includes, inc);
 	}
 	
+	int stdin_seen = 0;
 	for (; i < argc; i++) {
-		if (contains(settings->target_files.items, settings->target_files.count, argv[i]))
+		if (0 == strcmp(argv[i], "-")) {
+			if (stdin_seen)
+				continue;
+			stdin_seen = 1;
+			if (read_targets_stdin(settings) < 0)
+				return -1;
 			continue;
-
-		char* copy = strdup(argv[i]);
-		if (copy == NULL) {
-			perror("depi: strdup");
-			return -1;
 		}
-		pushback(settings->target_files, copy);
+
+		if (target_add(settings, argv[i], 1) < 0)
+			return -1;
 	} 
 
 	if (settings->target_files.count == 0) {

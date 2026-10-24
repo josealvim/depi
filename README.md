@@ -19,13 +19,14 @@ libc (`getline`, `strdup`, `fstatat`), and `O_DIRECTORY` support.
 ## Usage
 
 ```text
-depi [-h] <-I=path|-S=path>* <file>+
+depi [-h] <-I=path|-S=path>* <file|->+
 ```
 
 - `-I=path` — add an include search directory; its resolved dependencies are
   traversed recursively.
 - `-S=path` — add a system include search directory; its resolved dependencies
   are printed but not traversed.
+- `-` — read input paths from stdin, one per line.
 - `-h` — print help.
 
 Options must precede the input files. The `=` is part of the option syntax.
@@ -44,6 +45,20 @@ src/main.c: "include/foo.h" "include/bar.h"
 include/foo.h: "include/baz.h"
 ```
 
+### Reading paths from stdin
+
+Use `-` as a file operand to read paths from stdin, one per line:
+
+```sh
+find src -type f \( -name '*.c' -o -name '*.h' \) \
+    | ./depi -I=include -
+```
+
+`-` can be mixed with ordinary file operands and stdin is read at most once.
+Paths are preserved verbatim except for the trailing newline. Use
+`find -type f` and filter the names, because non-regular targets are errors. A
+literal file named `-` is addressed as `./-`.
+
 ## Behavior
 
 - Include directories are searched in the order given. The first directory
@@ -56,6 +71,8 @@ include/foo.h: "include/baz.h"
 - Include directories, input files, and repeated includes within one file are
   deduplicated. Angle-bracket and quoted forms of the same name are tracked
   separately.
+- Stdin input has no `ARG_MAX` limit. Duplicate stdin paths are harmless; files
+  are deduplicated by device/inode when targets are enqueued.
 - Each input or resolved file is processed once. Files are identified by
   device and inode, so cycles, aliases, and repeated includes terminate.
 - Traversal is breadth-first; every processed file gets its own line.
@@ -74,6 +91,8 @@ include/foo.h: "include/baz.h"
   conditionals, or line continuations; an include inside a block comment or
   inactive `#if` branch can still be reported.
 - Include names are resolved as given; `..` and symlinks are left to the OS.
+- Stdin paths are newline-separated; filenames containing newlines are not
+  supported, and NUL-separated `find -print0` input is not supported yet.
 
 ## License
 

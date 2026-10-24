@@ -1,0 +1,16 @@
+# Build output
+/depi
+
+# Editor and swap files
+*.swp
+*.swo
+*~
+
+# Object files and archives
+*.o
+*.a
+*.so
+
+# Core dumps
+core
+core.*

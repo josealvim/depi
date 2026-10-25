@@ -33,7 +33,12 @@
 struct include {
 	char* path;
 	int   fd;
-	int   is_system;   /* leaf node for recursion */
+	int   is_system;   /* omit resolved dependencies */
+};
+
+struct object_map {
+	char* pattern;
+	char* replacement;
 };
 
 struct settings {
@@ -46,6 +51,13 @@ struct settings {
 		size_t count, capacity;
 		char** items; 
 	} target_files;
+
+	struct {
+		size_t count, capacity;
+		struct object_map* items;
+	} maps;
+
+	int quiet;
 };
 
 struct file_id {
@@ -53,9 +65,28 @@ struct file_id {
 	ino_t ino;
 };
 
+struct edge_list {
+	size_t count, capacity;
+	size_t* items;
+};
+
+struct graph_node {
+	char* path;
+	char* object;
+	struct edge_list deps;
+	size_t visit;
+	int is_root;
+	int is_dep;
+};
+
+struct graph {
+	size_t count, capacity;
+	struct graph_node* items;
+};
+
 struct work_list {
 	size_t count, capacity;
-	char** items;
+	size_t* items;
 };
 
 struct dependency {
@@ -65,6 +96,7 @@ struct dependency {
 
 struct file_set_entry {
 	struct file_id id;
+	size_t node;
 	int used;
 };
 
@@ -98,6 +130,7 @@ struct resolve_cache {
 struct context {
 	struct settings const* settings;
 	struct resolve_cache* cache;
+	struct graph graph;
 	struct work_list work;
 	struct file_set visited;
 };
@@ -193,31 +226,38 @@ static void file_set_grow(struct file_set* set) {
 	set->capacity = new_capacity;
 }
 
-static int file_set_add(struct file_set* set, struct file_id id) {
+static int file_set_find(
+	struct file_set* set, struct file_id id, size_t* node
+) {
 	if (set->capacity == 0)
-		file_set_grow(set);
+		return 0;
 
 	size_t mask = set->capacity - 1;
 	size_t slot = (size_t)file_id_hash(id) & mask;
 	while (set->entries[slot].used) {
 		if (set->entries[slot].id.dev == id.dev &&
-		    set->entries[slot].id.ino == id.ino)
-			return 0;
+		    set->entries[slot].id.ino == id.ino) {
+			*node = set->entries[slot].node;
+			return 1;
+		}
 		slot = (slot + 1) & mask;
 	}
+	return 0;
+}
 
-	if (set->count + 1 > set->capacity - set->capacity / 4) {
+static void file_set_put(struct file_set* set, struct file_id id, size_t node) {
+	if (set->capacity == 0 || set->count + 1 > set->capacity - set->capacity / 4)
 		file_set_grow(set);
-		mask = set->capacity - 1;
-		slot = (size_t)file_id_hash(id) & mask;
-		while (set->entries[slot].used)
-			slot = (slot + 1) & mask;
-	}
+
+	size_t mask = set->capacity - 1;
+	size_t slot = (size_t)file_id_hash(id) & mask;
+	while (set->entries[slot].used)
+		slot = (slot + 1) & mask;
 
 	set->entries[slot].id = id;
+	set->entries[slot].node = node;
 	set->entries[slot].used = 1;
 	set->count++;
-	return 1;
 }
 
 static void file_set_free(struct file_set* set) {
@@ -225,9 +265,46 @@ static void file_set_free(struct file_set* set) {
 }
 
 static void work_free(struct work_list* work) {
-	for (size_t i = 0; i < work->count; i++)
-		free(work->items[i]);
 	free(work->items);
+}
+
+static void graph_free(struct graph* graph) {
+	for (size_t i = 0; i < graph->count; i++) {
+		free(graph->items[i].path);
+		free(graph->items[i].object);
+		free(graph->items[i].deps.items);
+	}
+	free(graph->items);
+}
+
+static size_t graph_node_add(struct context* ctx, char* path, struct file_id id) {
+	size_t node;
+	if (file_set_find(&ctx->visited, id, &node)) {
+		free(path);
+		return node;
+	}
+
+	struct graph_node entry = {
+		.path = path,
+		.object = NULL,
+		.deps = {0},
+		.visit = 0,
+		.is_root = 0,
+		.is_dep = 0,
+	};
+	pushback(ctx->graph, entry);
+	node = ctx->graph.count - 1;
+	file_set_put(&ctx->visited, id, node);
+	pushback(ctx->work, node);
+	return node;
+}
+
+static void graph_add_edge(
+	struct context* ctx, size_t from, char* path, struct file_id id
+) {
+	size_t to = graph_node_add(ctx, path, id);
+	ctx->graph.items[to].is_dep = 1;
+	pushback(ctx->graph.items[from].deps, to);
 }
 
 static int contains(char* const* items, size_t count, char const* value) {
@@ -259,10 +336,107 @@ static int find_include_path(
 	return -1;
 }
 
+static int map_add(struct settings* settings, char const* spec) {
+	char const* eq = strchr(spec, '=');
+	if (eq == NULL || eq == spec || eq[1] == '\0') {
+		fprintf(stderr, "depi: malformed --map='%s'\n", spec);
+		return -1;
+	}
+
+	size_t pattern_len = (size_t)(eq - spec);
+	size_t percents = 0;
+	for (size_t i = 0; i < pattern_len; i++) {
+		if (spec[i] == '%')
+			percents++;
+	}
+	if (percents > 1) {
+		fprintf(stderr, "depi: map pattern has more than one '%%': '%s'\n", spec);
+		return -1;
+	}
+
+	char* pattern = strndup(spec, pattern_len);
+	char* replacement = strdup(eq + 1);
+	if (pattern == NULL || replacement == NULL) {
+		free(pattern);
+		free(replacement);
+		perror("depi: strdup");
+		return -1;
+	}
+
+	struct object_map map = {
+		.pattern = pattern,
+		.replacement = replacement,
+	};
+	pushback(settings->maps, map);
+	return 0;
+}
+
+static char* object_map_apply(
+	struct settings const* settings, char const* source
+) {
+	for (size_t i = 0; i < settings->maps.count; i++) {
+		struct object_map const* map = &settings->maps.items[i];
+		char const* percent = strchr(map->pattern, '%');
+
+		if (percent == NULL) {
+			if (0 != strcmp(source, map->pattern))
+				continue;
+			char* object = strdup(map->replacement);
+			if (object == NULL) {
+				perror("depi: strdup");
+				exit(EXIT_FAILURE);
+			}
+			return object;
+		}
+
+		size_t prefix_len = (size_t)(percent - map->pattern);
+		char const* suffix = percent + 1;
+		size_t suffix_len = strlen(suffix);
+		size_t source_len = strlen(source);
+		if (source_len < prefix_len + suffix_len)
+			continue;
+		if (0 != strncmp(source, map->pattern, prefix_len))
+			continue;
+		if (0 != strcmp(source + source_len - suffix_len, suffix))
+			continue;
+
+		size_t capture_len = source_len - prefix_len - suffix_len;
+		char const* capture = source + prefix_len;
+		size_t repl_len = strlen(map->replacement);
+		size_t percents = 0;
+		for (size_t j = 0; j < repl_len; j++) {
+			if (map->replacement[j] == '%')
+				percents++;
+		}
+
+		char* object = malloc(repl_len + percents * capture_len + 1);
+		if (object == NULL) {
+			perror("depi: malloc");
+			exit(EXIT_FAILURE);
+		}
+
+		size_t pos = 0;
+		for (size_t j = 0; j < repl_len; j++) {
+			if (map->replacement[j] == '%') {
+				memcpy(object + pos, capture, capture_len);
+				pos += capture_len;
+			} else {
+				object[pos++] = map->replacement[j];
+			}
+		}
+		object[pos] = '\0';
+		return object;
+	}
+	return NULL;
+}
+
 void print_help(FILE* of) {
-	fprintf(of, "usage: depi [-h] <-I=path|-S=path>* <file|->+\n");
+	fprintf(of, "usage: depi [-h] [-q] <-I=path|-S=path>* --map=pattern=replacement <file|->+\n");
 	fprintf(of, "  -I=path  add an include search directory (options must precede files)\n");
-	fprintf(of, "  -S=path  add a system include directory (resolved dependencies are leaves)\n");
+	fprintf(of, "  -S=path  add a system include directory (resolved dependencies are omitted)\n");
+	fprintf(of, "  --map=pattern=replacement\n");
+	fprintf(of, "           map a root path to its object path (repeatable)\n");
+	fprintf(of, "  -q       suppress warnings\n");
 	fprintf(of, "  -        read file paths from stdin, one per line\n");
 	fprintf(of, "  -h       show this help\n");
 }
@@ -348,6 +522,12 @@ static void settings_free(struct settings* settings) {
 	for (size_t i = 0; i < settings->target_files.count; i++)
 		free(settings->target_files.items[i]);
 	free(settings->target_files.items);
+
+	for (size_t i = 0; i < settings->maps.count; i++) {
+		free(settings->maps.items[i].pattern);
+		free(settings->maps.items[i].replacement);
+	}
+	free(settings->maps.items);
 }
 
 static int target_add(struct settings* settings, char const* path, int dedup) {
@@ -403,6 +583,17 @@ int parse_settings(int argc, char** argv, struct settings* settings) {
 	for (; i < argc; i++) {
 		char const* value;
 		int is_system;
+
+		if (0 == strcmp(argv[i], "-q")) {
+			settings->quiet = 1;
+			continue;
+		}
+
+		if (0 == strncmp(argv[i], "--map=", 6)) {
+			if (map_add(settings, argv[i] + 6) < 0)
+				return -1;
+			continue;
+		}
 
 		if (0 == strncmp(argv[i], "-I=", 3)) {
 			value = argv[i] + 3;
@@ -466,23 +657,30 @@ int parse_settings(int argc, char** argv, struct settings* settings) {
 	return 0;
 }
 
-static void work_enqueue(struct context* ctx, char* path, struct file_id id) {
-	if (!file_set_add(&ctx->visited, id)) {
-		free(path);
-		return;
-	}
-	pushback(ctx->work, path);
-}
+static int prepare_roots(struct context* ctx) {
+	int status = 0;
 
-static void emit_resolved(
-	FILE* of, struct context* ctx, char* path,
-	struct file_id id, int is_system
-) {
-	fprintf(of, "\"%s\" ", path);
-	if (is_system)
-		free(path);
-	else
-		work_enqueue(ctx, path, id);
+	for (size_t i = 0; i < ctx->graph.count; i++) {
+		struct graph_node* node = &ctx->graph.items[i];
+		if (!node->is_root)
+			continue;
+
+		char* object = object_map_apply(ctx->settings, node->path);
+		if (object == NULL) {
+			fprintf(stderr, "depi: no object mapping for '%s'\n", node->path);
+			status = -1;
+			continue;
+		}
+		if (object[0] == '\0') {
+			fprintf(stderr, "depi: empty object mapping for '%s'\n", node->path);
+			free(object);
+			status = -1;
+			continue;
+		}
+		node->object = object;
+	}
+
+	return status;
 }
 
 static int work_add_target(struct context* ctx, char const* path) {
@@ -497,19 +695,82 @@ static int work_add_target(struct context* ctx, char const* path) {
 	}
 
 	struct file_id id = { .dev = sb.st_dev, .ino = sb.st_ino };
-	if (!file_set_add(&ctx->visited, id))
-		return 0;
-
 	char* copy = strdup(path);
 	if (copy == NULL) {
 		perror("depi: strdup");
 		exit(EXIT_FAILURE);
 	}
-	pushback(ctx->work, copy);
+
+	size_t node = graph_node_add(ctx, copy, id);
+	ctx->graph.items[node].is_root = 1;
 	return 0;
 }
 
-int do_file_line(FILE* of, char const* path, struct context* ctx) {
+static void print_make_path(char const* path) {
+	for (char const* p = path; *p != '\0'; p++) {
+		switch (*p) {
+		case '$':  fputs("$$", stdout); break;
+		case '#':  fputs("\\#", stdout); break;
+		case ' ':  fputs("\\ ", stdout); break;
+		case '\\': fputs("\\\\", stdout); break;
+		default:   fputc(*p, stdout); break;
+		}
+	}
+}
+
+static void print_make_deps(struct context* ctx) {
+	size_t generation = 0;
+	struct {
+		size_t count, capacity;
+		size_t* items;
+	} stack = {0};
+
+	for (size_t r = 0; r < ctx->graph.count; r++) {
+		struct graph_node* root = &ctx->graph.items[r];
+		if (!root->is_root)
+			continue;
+
+		generation++;
+		stack.count = 0;
+		pushback(stack, r);
+		root->visit = generation;
+
+		print_make_path(root->object);
+		fputs(": ", stdout);
+		print_make_path(root->path);
+
+		while (stack.count > 0) {
+			size_t n = stack.items[--stack.count];
+			struct graph_node* node = &ctx->graph.items[n];
+			for (size_t i = 0; i < node->deps.count; i++) {
+				size_t d = node->deps.items[i];
+				struct graph_node* dep = &ctx->graph.items[d];
+				if (dep->visit == generation)
+					continue;
+
+				dep->visit = generation;
+				fputc(' ', stdout);
+				print_make_path(dep->path);
+				pushback(stack, d);
+			}
+		}
+		fputc('\n', stdout);
+	}
+
+	for (size_t i = 0; i < ctx->graph.count; i++) {
+		struct graph_node* node = &ctx->graph.items[i];
+		if (!node->is_dep || node->is_root)
+			continue;
+
+		print_make_path(node->path);
+		fputs(":\n", stdout);
+	}
+
+	free(stack.items);
+}
+
+int do_file_line(size_t node_index, struct context* ctx) {
+	char const* path = ctx->graph.items[node_index].path;
 	FILE* file = fopen(path, "r");
 	ssize_t nread;
 	size_t line_cap = 0;
@@ -556,30 +817,32 @@ int do_file_line(FILE* of, char const* path, struct context* ctx) {
 		status = -1;
 	}
 
-	fprintf(of, "%s: ", path);
 	for (size_t i = 0; i < dependencies.count; i++) {
 		struct dependency const* dep = &dependencies.items[i];
 		char const* included = dep->name;
+		char* resolved_path = NULL;
 		struct file_id id = {0};
 
 		if (dep->quoted) {
-			char* local_path = join_path(source_dir, included);
+			resolved_path = join_path(source_dir, included);
 			struct stat sb;
-			if (stat(local_path, &sb) == 0) {
+			if (stat(resolved_path, &sb) == 0) {
 				if (S_ISREG(sb.st_mode)) {
 					id.dev = sb.st_dev;
 					id.ino = sb.st_ino;
-					emit_resolved(of, ctx, local_path, id, 0);
+					graph_add_edge(ctx, node_index, resolved_path, id);
 					continue;
 				}
-				free(local_path);
+				free(resolved_path);
+				resolved_path = NULL;
 			} else {
 				int err = errno;
-				if (err != ENOENT && err != ENOTDIR) {
+				if (err != ENOENT && err != ENOTDIR && !ctx->settings->quiet) {
 					fprintf(stderr, "depi: %s: %s\n",
-						local_path, strerror(err));
+						resolved_path, strerror(err));
 				}
-				free(local_path);
+				free(resolved_path);
+				resolved_path = NULL;
 			}
 		}
 
@@ -608,7 +871,7 @@ int do_file_line(FILE* of, char const* path, struct context* ctx) {
 				}
 
 				int err = errno;
-				if (err != ENOENT && err != ENOTDIR) {
+				if (err != ENOENT && err != ENOTDIR && !ctx->settings->quiet) {
 					fprintf(stderr, "depi: %s: %s: %s\n",
 						inc[j].path, included, strerror(err));
 				}
@@ -617,21 +880,25 @@ int do_file_line(FILE* of, char const* path, struct context* ctx) {
 		}
 
 		if (resolved < 0) {
-			if (dep->quoted)
+			if (dep->quoted) {
 				fprintf(stderr, "depi: '%s': include \"%s\" not found\n",
 					path, included);
-			else
+				status = -1;
+			} else if (!ctx->settings->quiet) {
 				fprintf(stderr, "depi: '%s': include <%s> not found\n",
 					path, included);
+			}
 			continue;
 		}
 
-		emit_resolved(
-			of, ctx, join_path(inc[resolved].path, included),
-			id, inc[resolved].is_system
+		if (inc[resolved].is_system)
+			continue;
+
+		graph_add_edge(
+			ctx, node_index,
+			join_path(inc[resolved].path, included), id
 		);
 	}
-	fprintf(of, "\n");	
 
 	if (fclose(file) != 0) {
 		fprintf(stderr, "depi: '%s': close: %s\n", path, strerror(errno));
@@ -673,9 +940,16 @@ int main(int argc, char** argv) {
 		struct include* inc = &settings.includes.items[i];
 		inc->fd = open(inc->path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 		if (inc->fd == -1) {
-			fprintf(stderr, "depi: include directory '%s': %s\n",
-				inc->path, strerror(errno));
-			failed = 1;
+			if (inc->is_system) {
+				if (!settings.quiet) {
+					fprintf(stderr, "depi: system include directory '%s': %s\n",
+						inc->path, strerror(errno));
+				}
+			} else {
+				fprintf(stderr, "depi: include directory '%s': %s\n",
+					inc->path, strerror(errno));
+				failed = 1;
+			}
 		}
 	}
 
@@ -688,17 +962,25 @@ int main(int argc, char** argv) {
 			failed = 1;
 	}
 
-	for (size_t i = 0; i < ctx.work.count; i++) {
-		char* path = ctx.work.items[i];
-		if (do_file_line(stdout, path, &ctx) < 0)
-			failed = 1;
+	if (!failed && prepare_roots(&ctx) < 0)
+		failed = 1;
+
+	if (!failed) {
+		for (size_t i = 0; i < ctx.work.count; i++) {
+			if (do_file_line(ctx.work.items[i], &ctx) < 0)
+				failed = 1;
+		}
 	}
+
+	if (!failed)
+		print_make_deps(&ctx);
 
 	if (fflush(stdout) != 0) {
 		fprintf(stderr, "depi: stdout: %s\n", strerror(errno));
 		failed = 1;
 	}
 
+	graph_free(&ctx.graph);
 	work_free(&ctx.work);
 	file_set_free(&ctx.visited);
 	cache_free(cache);

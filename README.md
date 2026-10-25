@@ -15,6 +15,18 @@ The build uses `gcc` and requires a C23 compiler with GNU extensions
 (statement expressions, `__auto_type`, `%m` scanf allocation), a POSIX/Linux
 libc (`getline`, `strdup`, `fstatat`), and `O_DIRECTORY` support.
 
+## Tests
+
+```sh
+./tests/run.sh
+```
+
+The suite always rebuilds `depi`, then runs the Python 3 `unittest` tests. It
+covers CLI parsing, include resolution, mapping, escaping, stdin input, depfile
+output, and the Make integration. The Make integration tests look for GNU Make
+(`gmake` or `make`) and are skipped when it is unavailable. The documented
+Makefile itself uses POSIX.1-2024 constructs.
+
 ## Usage
 
 ```text
@@ -88,7 +100,7 @@ For a source tree where `src/main.c` includes `src/a.h`, `include/b.h`, and
 `include/c.h`:
 
 ```make
-build/main.o: src/main.c src/a.h include/b.h include/c.h
+src/main.o: src/main.c src/a.h include/b.h include/c.h
 src/a.h:
 include/b.h:
 include/c.h:
@@ -104,40 +116,39 @@ To use depi from a Makefile:
 
 1. Define `DEPI`, its include flags, and at least one `--map=` rule. The mapped
    object paths must be exactly the paths used by `$(OBJS)` and the compile
-   pattern rule.
+   rules.
 2. Feed the source list to depi on stdin using `-`.
 3. Generate one dependency fragment with `--depfile=...` so the fragment
    depends on every source and header it scans.
-4. Include that fragment with `-include` after the default goal.
+4. Include that fragment with `include` after the rule that creates it.
 5. Use the generated object paths in the compile rules.
 
 At the command level, one invocation looks like:
 
 ```sh
-printf '%s\n' src/main.c \
-    | ./depi -I=include --map='src/%.c=build/%.o' -
+printf '%s\n' src/main.c src/util.c \
+    | ./depi -I=include --map='%.c=%.o' -
 ```
 
-The complete Makefile pattern is:
+A POSIX.1-2024 Makefile using depi is:
 
 ```make
-DEPI       := ./depi
-DEPI_FLAGS := -I=include
-MAP        := --map='src/%.c=build/%.o'
-SRCS       := $(wildcard src/*.c)
-OBJS       := $(patsubst src/%.c,build/%.o,$(SRCS))
-DEPFILE    := .depi.mk
+.POSIX:
+DEPI = ./depi
+DEPI_FLAGS = -I=include
+CFLAGS += -Iinclude
+MAP = --map='%.c=%.o'
+SRCS = src/main.c src/util.c
+OBJS = $(SRCS:.c=.o)
+DEPFILE = .depi.mk
 
 all: app
 
 app: $(OBJS)
-	$(CC) $(LDFLAGS) -o $@ $^
+	$(CC) $(LDFLAGS) -o $@ $(OBJS)
 
-build/%.o: src/%.c | build
+.c.o:
 	$(CC) $(CFLAGS) -c $< -o $@
-
-build:
-	mkdir -p $@
 
 $(DEPFILE): $(SRCS) $(DEPI)
 	@tmp="$@.$$$$"; \
@@ -147,17 +158,47 @@ $(DEPFILE): $(SRCS) $(DEPI)
 	    $(DEPI) --depfile="$@" $(MAP) $(DEPI_FLAGS) - > "$$tmp" && \
 	mv "$$tmp" "$@"
 
--include $(DEPFILE)
+include $(DEPFILE)
 ```
+
+This example keeps object files next to the sources so that the portable
+`.c.o` suffix rule can build them. POSIX make has no `%.o: %.c` pattern rules.
+The compiler include path in `CFLAGS` must mirror the directories passed to
+depi in `DEPI_FLAGS`.
+
+To use a separate build directory, set `MAP` to
+`--map='src/%.c=build/%.o'`, set `OBJS` to the corresponding paths, and write
+one explicit rule per source, for example:
+
+```make
+build/main.o: src/main.c
+	@mkdir -p $(@D)
+	$(CC) $(CFLAGS) -c $< -o $@
+```
+
+The `.POSIX:` line requests the standard defaults. With GNU Make that means
+`CC=c99` and `CFLAGS=-O1`; override them in the environment or on the command
+line if desired.
 
 depi emits a rule such as:
 
 ```make
-.depi.mk: src/main.c include/a.h include/b.h
+.depi.mk: src/main.c src/util.c src/a.h include/b.h
 ```
 
-so Make regenerates the fragment when any scanned source or header changes. Do
-not add a phony prerequisite such as `FORCE` or `always` to an included
+so Make regenerates the fragment when any scanned source or header changes.
+`include` is intentional: `-include` would silently ignore a depi failure.
+Because the depfile rule appears before the include line, the first invocation
+creates `.depi.mk` before it is read, and later invocations regenerate it from
+the self-dependency.
+
+This relies on the POSIX.1-2024 rule that missing or out-of-date included
+makefiles are rebuilt. GNU Make supports it. POSIX.1-2017 made no such
+guarantee; on older makes, generate `.depi.mk` before invoking make or use GNU
+Make. BSD make uses a different `.include` syntax and is not covered by this
+example.
+
+Do not add a phony prerequisite such as `FORCE` or `always` to an included
 makefile: Make will remake it, restart, see it is still out of date, and repeat
 forever. The trap removes the temporary file on failure and on HUP/INT/TERM.
 

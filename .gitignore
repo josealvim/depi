@@ -17,3 +17,7 @@ core.*
 
 # Local bug reproduction fixtures
 /bugs/
+
+# Python test artifacts
+__pycache__/
+*.pyc

@@ -14,3 +14,6 @@
 # Core dumps
 core
 core.*
+
+# Local bug reproduction fixtures
+/bugs/

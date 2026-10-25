@@ -57,6 +57,7 @@ struct settings {
 		struct object_map* items;
 	} maps;
 
+	char* depfile;
 	int quiet;
 };
 
@@ -431,11 +432,13 @@ static char* object_map_apply(
 }
 
 void print_help(FILE* of) {
-	fprintf(of, "usage: depi [-h] [-q] <-I=path|-S=path>* --map=pattern=replacement <file|->+\n");
+	fprintf(of, "usage: depi [-h] [-q] <-I=path|-S=path>* --map=pattern=replacement [--depfile=path] <file|->+\n");
 	fprintf(of, "  -I=path  add an include search directory (options must precede files)\n");
 	fprintf(of, "  -S=path  add a system include directory (resolved dependencies are omitted)\n");
 	fprintf(of, "  --map=pattern=replacement\n");
 	fprintf(of, "           map a root path to its object path (repeatable)\n");
+	fprintf(of, "  --depfile=path\n");
+	fprintf(of, "           emit a self-dependency rule for the generated fragment\n");
 	fprintf(of, "  -q       suppress warnings\n");
 	fprintf(of, "  -        read file paths from stdin, one per line\n");
 	fprintf(of, "  -h       show this help\n");
@@ -528,6 +531,8 @@ static void settings_free(struct settings* settings) {
 		free(settings->maps.items[i].replacement);
 	}
 	free(settings->maps.items);
+
+	free(settings->depfile);
 }
 
 static int target_add(struct settings* settings, char const* path, int dedup) {
@@ -592,6 +597,24 @@ int parse_settings(int argc, char** argv, struct settings* settings) {
 		if (0 == strncmp(argv[i], "--map=", 6)) {
 			if (map_add(settings, argv[i] + 6) < 0)
 				return -1;
+			continue;
+		}
+
+		if (0 == strncmp(argv[i], "--depfile=", 10)) {
+			char const* depfile_path = argv[i] + 10;
+			if (*depfile_path == '\0') {
+				fprintf(stderr, "depi: empty depfile path\n");
+				return -1;
+			}
+			if (settings->depfile != NULL) {
+				fprintf(stderr, "depi: --depfile specified more than once\n");
+				return -1;
+			}
+			settings->depfile = strdup(depfile_path);
+			if (settings->depfile == NULL) {
+				perror("depi: strdup");
+				return -1;
+			}
 			continue;
 		}
 
@@ -764,6 +787,16 @@ static void print_make_deps(struct context* ctx) {
 
 		print_make_path(node->path);
 		fputs(":\n", stdout);
+	}
+
+	if (ctx->settings->depfile != NULL) {
+		print_make_path(ctx->settings->depfile);
+		fputc(':', stdout);
+		for (size_t i = 0; i < ctx->graph.count; i++) {
+			fputc(' ', stdout);
+			print_make_path(ctx->graph.items[i].path);
+		}
+		fputc('\n', stdout);
 	}
 
 	free(stack.items);

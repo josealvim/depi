@@ -18,7 +18,7 @@ libc (`getline`, `strdup`, `fstatat`), and `O_DIRECTORY` support.
 ## Usage
 
 ```text
-depi [-h] [-q] <-I=path|-S=path>* --map=pattern=replacement <file|->+
+depi [-h] [-q] <-I=path|-S=path>* --map=pattern=replacement [--depfile=path] <file|->+
 ```
 
 - `-I=path` — add an include search directory.
@@ -26,6 +26,7 @@ depi [-h] [-q] <-I=path|-S=path>* --map=pattern=replacement <file|->+
   omitted from the generated dependency graph.
 - `--map=pattern=replacement` — map root source paths to object paths.
   Repeatable; required for every root.
+- `--depfile=path` — emit a self-dependency rule for the generated fragment.
 - `-q` — suppress warnings.
 - `-` — read source paths from stdin, one per line.
 - `-h` — print help.
@@ -105,8 +106,8 @@ To use depi from a Makefile:
    object paths must be exactly the paths used by `$(OBJS)` and the compile
    pattern rule.
 2. Feed the source list to depi on stdin using `-`.
-3. Generate one dependency fragment from a rule that is forced on every Make
-   invocation.
+3. Generate one dependency fragment with `--depfile=...` so the fragment
+   depends on every source and header it scans.
 4. Include that fragment with `-include` after the default goal.
 5. Use the generated object paths in the compile rules.
 
@@ -138,19 +139,27 @@ build/%.o: src/%.c | build
 build:
 	mkdir -p $@
 
-$(DEPFILE): $(DEPI) FORCE
-	@tmp=$@.$$$$; \
+$(DEPFILE): $(SRCS) $(DEPI)
+	@tmp="$@.$$$$"; \
+	trap 'rm -f "$$tmp"' 0; \
+	trap 'exit 1' 1 2 15; \
 	printf '%s\n' $(SRCS) | \
-	    $(DEPI) $(MAP) $(DEPI_FLAGS) - > $$tmp && mv $$tmp $@
+	    $(DEPI) --depfile="$@" $(MAP) $(DEPI_FLAGS) - > "$$tmp" && \
+	mv "$$tmp" "$@"
 
 -include $(DEPFILE)
-
-.PHONY: FORCE
-FORCE:
 ```
 
-`FORCE` regenerates the fragment on every Make invocation, so removed headers
-and changed include lists cannot leave stale dependencies behind.
+depi emits a rule such as:
+
+```make
+.depi.mk: src/main.c include/a.h include/b.h
+```
+
+so Make regenerates the fragment when any scanned source or header changes. Do
+not add a phony prerequisite such as `FORCE` or `always` to an included
+makefile: Make will remake it, restart, see it is still out of date, and repeat
+forever. The trap removes the temporary file on failure and on HUP/INT/TERM.
 
 ## Behavior
 
@@ -171,6 +180,9 @@ and changed include lists cannot leave stale dependencies behind.
 - Whitespace is allowed between `#` and `include`, and leading whitespace
   before `#` is accepted.
 - Generated Make paths escape spaces, `#`, `$`, and backslashes.
+- With `--depfile=path`, the output ends with a self-dependency rule for that
+  path, covering every scanned source and non-system header. Makefiles should
+  use this instead of forcing an included depfile with a phony target.
 
 ### Limitations
 

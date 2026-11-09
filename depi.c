@@ -33,7 +33,8 @@
 struct include {
 	char* path;
 	int   fd;
-	int   is_system;   /* omit resolved dependencies */
+	int   is_system;    /* omit resolved dependencies */
+	int   is_generated; /* unresolved includes are assumed to live here */
 };
 
 struct object_map {
@@ -78,6 +79,7 @@ struct graph_node {
 	size_t visit;
 	int is_root;
 	int is_dep;
+	int is_synthetic;
 };
 
 struct graph {
@@ -292,6 +294,7 @@ static size_t graph_node_add(struct context* ctx, char* path, struct file_id id)
 		.visit = 0,
 		.is_root = 0,
 		.is_dep = 0,
+		.is_synthetic = 0,
 	};
 	pushback(ctx->graph, entry);
 	node = ctx->graph.count - 1;
@@ -304,6 +307,40 @@ static void graph_add_edge(
 	struct context* ctx, size_t from, char* path, struct file_id id
 ) {
 	size_t to = graph_node_add(ctx, path, id);
+	ctx->graph.items[to].is_dep = 1;
+	pushback(ctx->graph.items[from].deps, to);
+}
+
+/* Add a dependency that does not exist yet and is assumed to be generated.
+ * Synthetic nodes are keyed by path rather than file identity and are never
+ * queued for scanning, since there is no file to read. Reusing an existing
+ * node with the same path keeps the output free of duplicate rules. */
+static size_t graph_synthetic_add(struct context* ctx, char* path) {
+	for (size_t i = 0; i < ctx->graph.count; i++) {
+		struct graph_node* node = &ctx->graph.items[i];
+		if (0 == strcmp(node->path, path)) {
+			free(path);
+			return i;
+		}
+	}
+
+	struct graph_node entry = {
+		.path = path,
+		.object = NULL,
+		.deps = {0},
+		.visit = 0,
+		.is_root = 0,
+		.is_dep = 0,
+		.is_synthetic = 1,
+	};
+	pushback(ctx->graph, entry);
+	return ctx->graph.count - 1;
+}
+
+static void graph_add_synthetic_edge(
+	struct context* ctx, size_t from, char* path
+) {
+	size_t to = graph_synthetic_add(ctx, path);
 	ctx->graph.items[to].is_dep = 1;
 	pushback(ctx->graph.items[from].deps, to);
 }
@@ -432,9 +469,10 @@ static char* object_map_apply(
 }
 
 void print_help(FILE* of) {
-	fprintf(of, "usage: depi [-h] [-q] <-I=path|-S=path>* --map=pattern=replacement [--depfile=path] <file|->+\n");
+	fprintf(of, "usage: depi [-h] [-q] <-I=path|-S=path|-G=path>* --map=pattern=replacement [--depfile=path] <file|->+\n");
 	fprintf(of, "  -I=path  add an include search directory (options must precede files)\n");
 	fprintf(of, "  -S=path  add a system include directory (resolved dependencies are omitted)\n");
+	fprintf(of, "  -G=path  add a generated include directory (unresolved includes are assumed to live there)\n");
 	fprintf(of, "  --map=pattern=replacement\n");
 	fprintf(of, "           map a root path to its object path (repeatable)\n");
 	fprintf(of, "  --depfile=path\n");
@@ -588,6 +626,7 @@ int parse_settings(int argc, char** argv, struct settings* settings) {
 	for (; i < argc; i++) {
 		char const* value;
 		int is_system;
+		int is_generated;
 
 		if (0 == strcmp(argv[i], "-q")) {
 			settings->quiet = 1;
@@ -621,9 +660,15 @@ int parse_settings(int argc, char** argv, struct settings* settings) {
 		if (0 == strncmp(argv[i], "-I=", 3)) {
 			value = argv[i] + 3;
 			is_system = 0;
+			is_generated = 0;
 		} else if (0 == strncmp(argv[i], "-S=", 3)) {
 			value = argv[i] + 3;
 			is_system = 1;
+			is_generated = 0;
+		} else if (0 == strncmp(argv[i], "-G=", 3)) {
+			value = argv[i] + 3;
+			is_system = 0;
+			is_generated = 1;
 		} else {
 			break;
 		}
@@ -639,6 +684,8 @@ int parse_settings(int argc, char** argv, struct settings* settings) {
 		if (existing >= 0) {
 			if (is_system)
 				settings->includes.items[existing].is_system = 1;
+			if (is_generated)
+				settings->includes.items[existing].is_generated = 1;
 			continue;
 		}
 
@@ -652,6 +699,7 @@ int parse_settings(int argc, char** argv, struct settings* settings) {
 			.path = copy,
 			.fd = -1,
 			.is_system = is_system,
+			.is_generated = is_generated,
 		};
 		pushback(settings->includes, inc);
 	}
@@ -793,6 +841,11 @@ static void print_make_deps(struct context* ctx) {
 		print_make_path(ctx->settings->depfile);
 		fputc(':', stdout);
 		for (size_t i = 0; i < ctx->graph.count; i++) {
+			/* A synthetic file may never exist. Listing it here would
+			 * keep the fragment out of date and make Make regenerate it
+			 * on every run, so leave it to the object rules. */
+			if (ctx->graph.items[i].is_synthetic)
+				continue;
 			fputc(' ', stdout);
 			print_make_path(ctx->graph.items[i].path);
 		}
@@ -818,6 +871,14 @@ int do_file_line(size_t node_index, struct context* ctx) {
 	struct include const* inc = ctx->settings->includes.items;
 	size_t nincs = ctx->settings->includes.count;
 	struct resolve_cache* cache = ctx->cache;
+	int generated = -1;
+
+	for (size_t j = 0; j < nincs; j++) {
+		if (inc[j].is_generated && !inc[j].is_system) {
+			generated = (int)j;
+			break;
+		}
+	}
 
 	if (file == NULL) {
 		fprintf(stderr, "depi: '%s': %s\n", path, strerror(errno));
@@ -913,6 +974,13 @@ int do_file_line(size_t node_index, struct context* ctx) {
 		}
 
 		if (resolved < 0) {
+			if (generated >= 0) {
+				graph_add_synthetic_edge(
+					ctx, node_index,
+					join_path(inc[generated].path, included)
+				);
+				continue;
+			}
 			if (dep->quoted) {
 				fprintf(stderr, "depi: '%s': include \"%s\" not found\n",
 					path, included);
@@ -973,14 +1041,21 @@ int main(int argc, char** argv) {
 		struct include* inc = &settings.includes.items[i];
 		inc->fd = open(inc->path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 		if (inc->fd == -1) {
+			int err = errno;
 			if (inc->is_system) {
 				if (!settings.quiet) {
 					fprintf(stderr, "depi: system include directory '%s': %s\n",
-						inc->path, strerror(errno));
+						inc->path, strerror(err));
+				}
+			} else if (inc->is_generated) {
+				/* Generated directories often do not exist on a clean tree. */
+				if (err != ENOENT && err != ENOTDIR && !settings.quiet) {
+					fprintf(stderr, "depi: generated include directory '%s': %s\n",
+						inc->path, strerror(err));
 				}
 			} else {
 				fprintf(stderr, "depi: include directory '%s': %s\n",
-					inc->path, strerror(errno));
+					inc->path, strerror(err));
 				failed = 1;
 			}
 		}

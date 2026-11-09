@@ -78,6 +78,7 @@ class CliTests(DepiTestCase):
         result = self.run_depi("-h")
         self.assertEqual(result.returncode, 0)
         self.assertIn("usage: depi", result.stdout)
+        self.assertIn("-G=path", result.stdout)
         self.assertIn("--map", result.stdout)
         self.assertIn("--depfile", result.stdout)
         self.assertEqual(result.stderr, "")
@@ -254,6 +255,196 @@ class ResolutionTests(DepiTestCase):
         quiet = self.ok("-q", *common)
         self.assertEqual(quiet.stdout, "build/main.o: src/main.c\n")
         self.assertEqual(quiet.stderr, "")
+
+
+class GeneratedIncludeTests(DepiTestCase):
+    def test_missing_quoted_include_is_synthetic(self):
+        self.write("src/main.c", '#include "config.h"\n')
+        result = self.ok(
+            "-G=build/gen", "--map=src/%.c=build/%.o", "src/main.c"
+        )
+        self.assertEqual(
+            result.stdout,
+            lines(
+                "build/main.o: src/main.c build/gen/config.h",
+                "build/gen/config.h:",
+            ),
+        )
+        self.assertEqual(result.stderr, "")
+
+    def test_missing_angle_include_is_synthetic(self):
+        self.write("src/main.c", "#include <config.h>\n")
+        result = self.ok(
+            "-G=gen", "--map=src/%.c=build/%.o", "src/main.c"
+        )
+        self.assertEqual(
+            result.stdout,
+            lines(
+                "build/main.o: src/main.c gen/config.h",
+                "gen/config.h:",
+            ),
+        )
+        self.assertEqual(result.stderr, "")
+
+    def test_generated_header_is_scanned_when_present(self):
+        self.write("gen/config.h", '#include "detail.h"\n')
+        self.write("gen/detail.h")
+        self.write("src/main.c", "#include <config.h>\n")
+
+        result = self.ok(
+            "-G=gen", "--map=src/%.c=build/%.o", "src/main.c"
+        )
+        self.assertEqual(
+            result.stdout,
+            lines(
+                "build/main.o: src/main.c gen/config.h gen/detail.h",
+                "gen/config.h:",
+                "gen/detail.h:",
+            ),
+        )
+        self.assertEqual(result.stderr, "")
+
+    def test_nested_missing_include_is_synthetic(self):
+        self.write("gen/config.h", '#include "detail.h"\n')
+        self.write("src/main.c", "#include <config.h>\n")
+
+        result = self.ok(
+            "-G=gen", "--map=src/%.c=build/%.o", "src/main.c"
+        )
+        self.assertEqual(
+            result.stdout,
+            lines(
+                "build/main.o: src/main.c gen/config.h gen/detail.h",
+                "gen/config.h:",
+                "gen/detail.h:",
+            ),
+        )
+        self.assertEqual(result.stderr, "")
+
+    def test_missing_generated_directory_is_not_fatal(self):
+        self.write("src/main.c")
+        result = self.ok(
+            "-G=missing", "--map=src/%.c=build/%.o", "src/main.c"
+        )
+        self.assertEqual(result.stdout, "build/main.o: src/main.c\n")
+        self.assertEqual(result.stderr, "")
+
+    def test_first_generated_directory_is_used_for_synthesis(self):
+        self.write("src/main.c", '#include "config.h"\n')
+        result = self.ok(
+            "-G=gen1",
+            "-G=gen2",
+            "--map=src/%.c=build/%.o",
+            "src/main.c",
+        )
+        self.assertEqual(
+            result.stdout,
+            lines(
+                "build/main.o: src/main.c gen1/config.h",
+                "gen1/config.h:",
+            ),
+        )
+        self.assertEqual(result.stderr, "")
+
+    def test_include_search_order_with_generated_directories(self):
+        self.write("inc/pick.h")
+        self.write("gen/pick.h")
+        self.write("src/main.c", "#include <pick.h>\n")
+        common = ("--map=src/%.c=build/%.o", "src/main.c")
+
+        first = self.ok("-I=inc", "-G=gen", *common)
+        self.assertEqual(
+            first.stdout,
+            lines(
+                "build/main.o: src/main.c inc/pick.h",
+                "inc/pick.h:",
+            ),
+        )
+
+        second = self.ok("-G=gen", "-I=inc", *common)
+        self.assertEqual(
+            second.stdout,
+            lines(
+                "build/main.o: src/main.c gen/pick.h",
+                "gen/pick.h:",
+            ),
+        )
+
+    def test_local_quoted_include_wins_over_generated(self):
+        self.write("src/config.h")
+        self.write("src/main.c", '#include "config.h"\n')
+        result = self.ok(
+            "-G=gen", "--map=src/%.c=build/%.o", "src/main.c"
+        )
+        self.assertEqual(
+            result.stdout,
+            lines(
+                "build/main.o: src/main.c src/config.h",
+                "src/config.h:",
+            ),
+        )
+        self.assertEqual(result.stderr, "")
+
+    def test_synthetic_dependency_is_deduplicated(self):
+        self.write("src/a.c", '#include "config.h"\n')
+        self.write("src/b.c", '#include "config.h"\n')
+        result = self.ok(
+            "-G=gen",
+            "--map=src/%.c=build/%.o",
+            "src/a.c",
+            "src/b.c",
+        )
+        self.assertEqual(
+            result.stdout,
+            lines(
+                "build/a.o: src/a.c gen/config.h",
+                "build/b.o: src/b.c gen/config.h",
+                "gen/config.h:",
+            ),
+        )
+
+    def test_depfile_omits_synthetic_dependency(self):
+        self.write("src/main.c", '#include "config.h"\n')
+        result = self.ok(
+            "-G=gen",
+            "--map=src/%.c=build/%.o",
+            "--depfile=.depi.mk",
+            "src/main.c",
+        )
+        # Listing a file that may never exist in the self-rule would keep
+        # the fragment out of date and make Make regenerate it forever.
+        self.assertEqual(
+            result.stdout,
+            lines(
+                "build/main.o: src/main.c gen/config.h",
+                "gen/config.h:",
+                ".depi.mk: src/main.c",
+            ),
+        )
+
+    def test_system_directory_wins_over_generated(self):
+        self.write("gen/sys.h")
+        self.write("src/main.c", "#include <sys.h>\n")
+        result = self.ok(
+            "-G=gen", "-S=gen", "--map=src/%.c=build/%.o", "src/main.c"
+        )
+        self.assertEqual(result.stdout, "build/main.o: src/main.c\n")
+        self.assertEqual(result.stderr, "")
+
+    def test_system_directory_disables_synthesis_for_same_path(self):
+        self.write("gen/keep")
+        self.write("src/main.c", '#include "missing.h"\n')
+        result = self.expect_failure(
+            "-G=gen", "-S=gen", "--map=src/%.c=build/%.o", "src/main.c"
+        )
+        self.assertIn('include "missing.h" not found', result.stderr)
+
+    def test_empty_generated_path_is_rejected(self):
+        self.write("src/main.c")
+        result = self.expect_failure(
+            "-G=", "--map=src/%.c=build/%.o", "src/main.c"
+        )
+        self.assertIn("empty include path", result.stderr)
 
 
 class MappingTests(DepiTestCase):
@@ -642,6 +833,102 @@ include $(DEPFILE)
         self.assertIn("BUILD src/main.o", third.stdout)
         depfile = (self.dir / ".depi.mk").read_text()
         self.assertIn("src/main.o: src/main.c src/a.h src/b.h", depfile)
+
+    def test_generated_header_is_built_before_object(self):
+        self.write("src/main.c", '#include "config.h"\n')
+        self.write("gen/config.in", "#define GENERATED 1\n")
+        self.write("gen/detail.h")
+        makefile = """\
+.POSIX:
+DEPI = depi
+DEPFILE = .depi.mk
+SRCS = src/main.c
+
+all: src/main.o
+
+gen/config.h: gen/config.in
+	@printf '#include "detail.h"\\n' > $@
+
+.c.o:
+	@echo BUILD $@
+	@touch $@
+
+$(DEPFILE): $(SRCS) $(DEPI)
+	@tmp="$@.$$$$"; \\
+	trap 'rm -f "$$tmp"' 0; \\
+	trap 'exit 1' 1 2 15; \\
+	printf '%s\\n' $(SRCS) | \\
+	    "$(DEPI)" --depfile="$@" --map='%.c=%.o' -G=gen - > "$$tmp" && \\
+	mv "$$tmp" "$@"
+
+include $(DEPFILE)
+"""
+        (self.dir / "Makefile").write_text(makefile)
+
+        first = self.run_make()
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn("BUILD src/main.o", first.stdout)
+        depfile = (self.dir / ".depi.mk").read_text()
+        self.assertIn("src/main.o: src/main.c gen/config.h", depfile)
+        self.assertIn(".depi.mk: src/main.c", depfile)
+        self.assertNotIn("gen/detail.h", depfile)
+
+        # A later run sees the generated header and scans its includes.
+        time.sleep(0.02)
+        self.write("src/main.c", '#include "config.h"\n/* touched */\n')
+        second = self.run_make()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("BUILD src/main.o", second.stdout)
+        depfile = (self.dir / ".depi.mk").read_text()
+        self.assertIn(
+            "src/main.o: src/main.c gen/config.h gen/detail.h", depfile
+        )
+        self.assertIn(
+            ".depi.mk: src/main.c gen/config.h gen/detail.h", depfile
+        )
+
+        third = self.run_make()
+        self.assertEqual(third.returncode, 0, third.stderr)
+        self.assertNotIn("BUILD", third.stdout)
+
+    def test_missing_generated_header_does_not_loop_without_rule(self):
+        self.write("src/main.c", '#include "config.h"\n')
+        makefile = """\
+.POSIX:
+DEPI = depi
+DEPFILE = .depi.mk
+SRCS = src/main.c
+
+all: src/main.o
+
+.c.o:
+	@echo BUILD $@
+	@touch $@
+
+$(DEPFILE): $(SRCS) $(DEPI)
+	@tmp="$@.$$$$"; \\
+	trap 'rm -f "$$tmp"' 0; \\
+	trap 'exit 1' 1 2 15; \\
+	printf '%s\\n' $(SRCS) | \\
+	    "$(DEPI)" --depfile="$@" --map='%.c=%.o' -G=gen - > "$$tmp" && \\
+	mv "$$tmp" "$@"
+
+include $(DEPFILE)
+"""
+        (self.dir / "Makefile").write_text(makefile)
+
+        try:
+            first = self.run_make(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.fail("make regenerated the depfile indefinitely")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn("BUILD src/main.o", first.stdout)
+
+        try:
+            second = self.run_make(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.fail("make regenerated the depfile indefinitely")
+        self.assertEqual(second.returncode, 0, second.stderr)
 
     def test_documented_pattern_terminates(self):
         self.write("src/main.c", "#include \"a.h\"\n")

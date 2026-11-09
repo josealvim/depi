@@ -30,12 +30,16 @@ Makefile itself uses POSIX.1-2024 constructs.
 ## Usage
 
 ```text
-depi [-h] [-q] <-I=path|-S=path>* --map=pattern=replacement [--depfile=path] <file|->+
+depi [-h] [-q] <-I=path|-S=path|-G=path>* --map=pattern=replacement [--depfile=path] <file|->+
 ```
 
 - `-I=path` — add an include search directory.
 - `-S=path` — add a system include directory; dependencies resolved there are
   omitted from the generated dependency graph.
+- `-G=path` — add a generated include directory. Dependencies resolved there
+  are included normally. If an include cannot be resolved anywhere, it is
+  assumed to be generated under the first `-G` directory and is emitted as a
+  weak dependency. A missing `-G` directory is not an error.
 - `--map=pattern=replacement` — map root source paths to object paths.
   Repeatable; required for every root.
 - `--depfile=path` — emit a self-dependency rule for the generated fragment.
@@ -164,7 +168,11 @@ include $(DEPFILE)
 This example keeps object files next to the sources so that the portable
 `.c.o` suffix rule can build them. POSIX make has no `%.o: %.c` pattern rules.
 The compiler include path in `CFLAGS` must mirror the directories passed to
-depi in `DEPI_FLAGS`.
+depi in `DEPI_FLAGS`. If headers are generated into a directory that might not
+exist on a clean tree, pass it with `-G=dir` instead of `-I=dir`; depi emits the
+generated paths as prerequisites so Make builds them before the objects. Add
+those headers to the depfile rule as well if their own includes need to be
+scanned on the first build.
 
 To use a separate build directory, set `MAP` to
 `--map='src/%.c=build/%.o'`, set `OBJS` to the corresponding paths, and write
@@ -207,23 +215,38 @@ forever. The trap removes the temporary file on failure and on HUP/INT/TERM.
 - Include directories are searched in the order given. The first directory
   containing a matching regular file wins.
 - Quoted includes (`#include "file.h"`) search the directory containing the
-  including file first, then the configured `-I`/`-S` directories. Angle-bracket
-  includes (`#include <file.h>`) search only the configured directories.
+  including file first, then the configured `-I`/`-S`/`-G` directories.
+  Angle-bracket includes (`#include <file.h>`) search only the configured
+  directories.
 - Dependencies resolved through `-S` are not added to the graph and produce no
   rules or stubs.
+- Dependencies resolved through `-G` are handled like `-I`: they are added to
+  the graph and scanned recursively.
+- If an include is not found in any directory and at least one non-system `-G`
+  directory exists, depi emits `<first -G directory>/<include name>` as a
+  synthetic dependency. It produces a normal prerequisite and empty rule, but
+  the file is not opened or scanned. This covers headers that do not exist yet
+  but will be generated during the build. The file is not listed in the
+  `--depfile` self-dependency: that rule must stay satisfied while the file
+  does not exist, or Make would regenerate the fragment forever. Once the file
+  exists, a later depi run resolves and scans it normally. If the same path is
+  given with both `-S` and `-G`, `-S` takes precedence.
 - Each root gets one object rule. Root aliases are deduplicated by device/inode,
   so a hard link or symlink alias produces only one rule.
-- Unresolved quoted includes are fatal. Unresolved angle-bracket includes are
-  warnings and can be suppressed with `-q`. This distinction is heuristic: see
-  the limitations below.
+- Without `-G`, unresolved quoted includes are fatal and unresolved
+  angle-bracket includes are warnings that can be suppressed with `-q`. With
+  `-G`, both are synthesized silently. This distinction is heuristic: see the
+  limitations below.
 - Missing project include directories are fatal; missing system include
-  directories are warnings.
+  directories are warnings; missing generated include directories are ignored.
 - Whitespace is allowed between `#` and `include`, and leading whitespace
   before `#` is accepted.
 - Generated Make paths escape spaces, `#`, `$`, and backslashes.
 - With `--depfile=path`, the output ends with a self-dependency rule for that
-  path, covering every scanned source and non-system header. Makefiles should
-  use this instead of forcing an included depfile with a phony target.
+  path, covering every scanned source and non-system dependency. Synthetic
+  `-G` dependencies are deliberately omitted so a file that never appears
+  cannot force endless regeneration. Makefiles should use this instead of
+  forcing an included depfile with a phony target.
 
 ### Limitations
 
@@ -235,7 +258,16 @@ forever. The trap removes the temporary file on failure and on HUP/INT/TERM.
   missing project header written as `#include <foo.h>` is not fatal, while a
   missing system header written as `#include "foo.h"` is fatal. `-S` paths
   cannot resolve this ambiguity because an unresolved name never matches a
-  path.
+  path; use `-G` when unresolved names are generated headers.
+- A synthetic generated dependency is a guess: it is placed under the first
+  non-system `-G` directory. If the header is generated elsewhere, the fragment
+  names the wrong file. If it is never generated, it remains a missing
+  prerequisite, so dependent objects rebuild on every build. Because it is
+  omitted from the depfile self-rule, the header's own includes are only picked
+  up by a depi run that happens after the header exists, such as a run caused
+  by a source change. Add generated headers to the Makefile's depfile rule if
+  they must be scanned on the first build.
+- `-G` only applies to includes. Source files listed as roots must still exist.
 - Macro includes and unterminated header names are ignored.
 - The scanner is line-based and does not evaluate comments, strings,
   conditionals, or line continuations; an include inside a block comment or
